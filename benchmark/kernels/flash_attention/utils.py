@@ -22,7 +22,7 @@ def create_kv_cache_data(
 def create_qkv_data(total_tokens, q_head_num, kv_head_num, head_dim, dtype=jnp.bfloat16, seed=42):
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 3)
-    q = jax.random.normal(keys[0], (total_tokens, q_head_num, head_dim), dtype=dtype)
+    q = jax.random.normal(keys[0], (total_tokens, q_head_num, head_dim), dtype=jnp.bfloat16)
     k = jax.random.normal(keys[1], (total_tokens, kv_head_num, head_dim), dtype=dtype)
     v = jax.random.normal(keys[2], (total_tokens, kv_head_num, head_dim), dtype=dtype)
     return q, k, v

@@ -270,7 +270,7 @@ def prefill_benchmark():
 
             flops = 2 * max_num_batched_tokens * (max_num_batched_tokens + 512) * q_head_num * head_dim
             speed = flops / time_ms * 1000
-            mfu = speed / tpu_info.fp8_ops_per_second
+            mfu = speed / tpu_info.bf16_ops_per_second
             print(f"cost: {time_ms:.4}ms, mfu: {mfu * 100:.1f}%")
 
 
@@ -304,7 +304,7 @@ def decode_benchmark():
                 except Exception as e:
                     raise ValueError(f"run failed: {e=}")
 
-                rw_bytes = max_num_batched_tokens * head_dim * ((prefix_len + 1) * 2 * kv_head_num + 2 * q_head_num) * 1
+                rw_bytes = max_num_batched_tokens * head_dim * ((prefix_len + 1) * 2 * kv_head_num + 2 * q_head_num) * 2
                 throughput = rw_bytes / time_ms * 1000
                 mbu = throughput / tpu_info.mem_bw_bytes_per_second
                 print(f"cost: {time_ms:.4}ms, mbu: {mbu * 100:.1f}%")
