@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from tpu_inference.kernels.ragged_paged_attention.v3.util import cdiv, get_dtype_packing
+from tpu_inference.kernels.ragged_paged_attention.v3.util import align_to, cdiv, get_dtype_packing
 
 
 def create_kv_cache_data(
@@ -13,7 +13,7 @@ def create_kv_cache_data(
     total_num_pages = cdiv(max_kv_cache_tokens, page_size)
     kv_cache = jax.random.normal(
         keys[1],
-        (total_num_pages, page_size, head_num * 2 // packing, packing, head_dim),
+        (total_num_pages, page_size, align_to(head_num * 2, packing) // packing, packing, head_dim),
         dtype=dtype,
     )
     return kv_cache
