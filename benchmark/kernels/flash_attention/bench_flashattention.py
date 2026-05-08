@@ -8,6 +8,8 @@ from jax.experimental.pallas import tpu as pltpu
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     RpaCase,
     get_default_block_sizes,
+)
+from tpu_inference.kernels.experimental.batched_rpa.wrapper import (
     ragged_paged_attention,
 )
 
@@ -117,6 +119,7 @@ def benchmark_prefill_backend(
     kv_head_num,
     head_dim,
     page_size,
+    kv_dtype,
     sliding_window=None,
 ):
     (
@@ -140,7 +143,7 @@ def benchmark_prefill_backend(
         kv_head_num,
         head_dim,
         page_size=page_size,
-        dtype=jnp.float8_e4m3fn,
+        dtype=kv_dtype,
     )
     return _run_attention_benchmark(
         q,
@@ -170,6 +173,7 @@ def benchmark_decode_backend(
     kv_head_num,
     head_dim,
     page_size,
+    kv_dtype,
     sliding_window=None,
 ):
     (
@@ -194,7 +198,7 @@ def benchmark_decode_backend(
         kv_head_num,
         head_dim,
         page_size=page_size,
-        dtype=jnp.float8_e4m3fn,
+        dtype=kv_dtype,
     )
     return _run_attention_benchmark(
         q,
@@ -223,6 +227,9 @@ MAX_CONTEXT_LEN = 40960
 MAX_NUM_BATCHED_TOKENS_CONFIG_FOR_PREFILL = [1024, 2048, 4096, 8192, 16384, 32768]
 DECODE_PREFIX_LEN_CONFIG = [1024, 4096, 8192, 16384, 32768]
 MAX_NUM_BATCHED_TOKENS_CONFIG_FOR_DECODE = [32, 64]
+
+KV_DTYPE = jnp.bfloat16
+# KV_DTYPE = jnp.float8_e4m3fn
 
 tpu_info = pltpu.get_tpu_info()
 
@@ -264,6 +271,7 @@ def prefill_benchmark():
                     kv_head_num,
                     head_dim,
                     page_size,
+                    KV_DTYPE,
                 )
             except Exception as e:
                 raise ValueError(f"run failed: {e=}")
@@ -300,6 +308,7 @@ def decode_benchmark():
                         kv_head_num,
                         head_dim,
                         page_size,
+                        KV_DTYPE,
                     )
                 except Exception as e:
                     raise ValueError(f"run failed: {e=}")
