@@ -39,6 +39,54 @@ def _maybe_enable_compilation_cache_from_env() -> None:
 _maybe_enable_compilation_cache_from_env()
 
 
+def _perf_extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
+    # When task is provided, prefer matching kernel events by name directly.
+    # This gives accurate device_duration_ps from pallas kernel events,
+    # whereas MARKER scope events (call-done) may report incorrect durations.
+    if task:
+        event_matcher = re.compile(task)
+        events = []
+        for e in trace.get("traceEvents", []):
+            if "name" in e and event_matcher.search(e["name"]):
+                events.append(e)
+        if events:
+            min_pid = min(e["pid"] for e in events)
+            events_from_min_pid = [e for e in events if e["pid"] == min_pid]
+            durations_ms: list[float] = []
+            for e in events_from_min_pid:
+                if e.get("args", {}).get("device_duration_ps"):
+                    durations_ms.append(float(e["args"]["device_duration_ps"]) / 1e9)
+                elif "dur" in e:
+                    durations_ms.append(float(e["dur"]) / 1e3)
+            return durations_ms
+
+    # Fallback: use MARKER-based extraction
+    marker_events: list[dict[str, Any]] = []
+    for e in trace.get("traceEvents", []):
+        args = e.get("args", {})
+        tf_op = args.get("tf_op", "")
+        if MARKER in tf_op:
+            marker_events.append(e)
+
+    marker_call_done_events = [e for e in marker_events if e.get("name", "").endswith("call-done")]
+    if marker_call_done_events:
+        marker_events = marker_call_done_events
+
+    if not marker_events:
+        return []
+
+    min_pid = min(e["pid"] for e in marker_events)
+    events_from_min_pid = [e for e in marker_events if e["pid"] == min_pid]
+    durations_ms = []
+    for e in events_from_min_pid:
+        args = e.get("args", {})
+        if "device_duration_ps" in args:
+            durations_ms.append(float(args["device_duration_ps"]) / 1e9)
+        elif "dur" in e:
+            durations_ms.append(float(e["dur"]) / 1e3)
+    return durations_ms
+
+
 def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
     marker_events: list[dict[str, Any]] = []
     for e in trace.get("traceEvents", []):
@@ -145,4 +193,4 @@ def multiple_iteration_timeit_from_trace(
                     jax.block_until_ready(out)
 
     trace = _load_trace(trace_dir)
-    return _extract_marker_durations_ms(trace, task=task)
+    return _perf_extract_marker_durations_ms(trace, task=task)
