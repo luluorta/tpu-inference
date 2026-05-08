@@ -1,6 +1,7 @@
 import functools
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
@@ -139,6 +140,7 @@ def benchmark_prefill_backend(
         kv_head_num,
         head_dim,
         page_size=page_size,
+        dtype=jnp.float8_e4m3fn,
     )
     return _run_attention_benchmark(
         q,
@@ -192,6 +194,7 @@ def benchmark_decode_backend(
         kv_head_num,
         head_dim,
         page_size=page_size,
+        dtype=jnp.float8_e4m3fn,
     )
     return _run_attention_benchmark(
         q,
@@ -267,7 +270,7 @@ def prefill_benchmark():
 
             flops = 2 * max_num_batched_tokens * (max_num_batched_tokens + 512) * q_head_num * head_dim
             speed = flops / time_ms * 1000
-            mfu = speed / tpu_info.bf16_ops_per_second
+            mfu = speed / tpu_info.fp8_ops_per_second
             print(f"cost: {time_ms:.4}ms, mfu: {mfu * 100:.1f}%")
 
 
@@ -301,7 +304,7 @@ def decode_benchmark():
                 except Exception as e:
                     raise ValueError(f"run failed: {e=}")
 
-                rw_bytes = max_num_batched_tokens * head_dim * ((prefix_len + 1) * 2 * kv_head_num + 2 * q_head_num) * 2
+                rw_bytes = max_num_batched_tokens * head_dim * ((prefix_len + 1) * 2 * kv_head_num + 2 * q_head_num) * 1
                 throughput = rw_bytes / time_ms * 1000
                 mbu = throughput / tpu_info.mem_bw_bytes_per_second
                 print(f"cost: {time_ms:.4}ms, mbu: {mbu * 100:.1f}%")
