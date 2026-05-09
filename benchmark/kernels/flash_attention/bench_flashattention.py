@@ -101,6 +101,8 @@ def _run_attention_benchmark(
     if sliding_window is not None:
         scope_name += f"-sw_{sliding_window}"
 
+    scope_name = "jit__jitted_attn*"
+
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
