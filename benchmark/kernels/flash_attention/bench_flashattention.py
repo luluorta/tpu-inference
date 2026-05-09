@@ -48,14 +48,7 @@ def _jitted_attn(
 
 
 def _run_attention_benchmark(
-    q,
-    k,
-    v,
-    kv_cache,
-    kv_lens,
-    page_indices,
-    cu_q_lens,
-    distribution,
+    data_factory,
     rpa_case,
     q_head_num,
     kv_head_num,
@@ -64,6 +57,21 @@ def _run_attention_benchmark(
     max_num_batched_tokens,
     sliding_window=None,
 ):
+    (
+        q,
+        k,
+        v,
+        _kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        _,
+        _,
+        _,
+        _,
+        distribution,
+    ) = data_factory()
+
     scale = head_dim**-0.5
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
@@ -79,19 +87,26 @@ def _run_attention_benchmark(
         pages_per_seq,
         case=rpa_case,
     )
-    attn = functools.partial(
-        _jitted_attn,
-        q,
-        k,
-        v,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        scale,
-        sliding_window=sliding_window,
-    )
+
+    def _gen_qkv_cache():
+        sample = data_factory()
+        q_, k_, v_, kv_cache_ = sample[0], sample[1], sample[2], sample[3]
+        jax.block_until_ready((q_, k_, v_, kv_cache_))
+        return (q_, k_, v_, kv_cache_)
+
+    def _compute(q_, k_, v_, kv_cache_):
+        return _jitted_attn(
+            q_,
+            k_,
+            v_,
+            kv_cache_,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            scale,
+            sliding_window=sliding_window,
+        )
 
     scope_name = (
         f"RPA{rpa_case.symbol}-p_{page_size}"
@@ -104,8 +119,8 @@ def _run_attention_benchmark(
     scope_name = "jit__jitted_attn*"
 
     times = multiple_iteration_timeit_from_trace(
-        compute_func=lambda: attn(),
-        data_generator=lambda: (),
+        compute_func=_compute,
+        data_generator=_gen_qkv_cache,
         task=scope_name,
         tries=5,
         warmup=3,
@@ -124,20 +139,8 @@ def benchmark_prefill_backend(
     kv_dtype,
     sliding_window=None,
 ):
-    (
-        q,
-        k,
-        v,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        _,
-        _,
-        _,
-        _,
-        distribution,
-    ) = create_prefill_uniform_data(
+    data_factory = functools.partial(
+        create_prefill_uniform_data,
         max_context_len,
         max_kv_cache_tokens,
         max_num_batched_tokens,
@@ -148,14 +151,7 @@ def benchmark_prefill_backend(
         dtype=kv_dtype,
     )
     return _run_attention_benchmark(
-        q,
-        k,
-        v,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
+        data_factory,
         RpaCase.MIXED,
         q_head_num,
         kv_head_num,
@@ -178,20 +174,8 @@ def benchmark_decode_backend(
     kv_dtype,
     sliding_window=None,
 ):
-    (
-        q,
-        k,
-        v,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        _,
-        _,
-        _,
-        _,
-        distribution,
-    ) = create_decode_uniform_data(
+    data_factory = functools.partial(
+        create_decode_uniform_data,
         max_context_len,
         max_kv_cache_tokens,
         prefix_len,
@@ -203,14 +187,7 @@ def benchmark_decode_backend(
         dtype=kv_dtype,
     )
     return _run_attention_benchmark(
-        q,
-        k,
-        v,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
+        data_factory,
         RpaCase.DECODE,
         q_head_num,
         kv_head_num,
