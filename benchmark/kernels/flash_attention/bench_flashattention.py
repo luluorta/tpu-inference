@@ -20,7 +20,7 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 @functools.partial(
     jax.jit,
     static_argnames=["sm_scale", "sliding_window"],
-    donate_argnames=["q", "k", "v", "kv_cache"],
+    donate_argnames=["q", "kv_cache"],
 )
 def _jitted_attn(
     q,
@@ -206,7 +206,7 @@ MAX_KV_CACHE_TOKENS_CONFIG = [600000]
 MAX_CONTEXT_LEN = 40960
 MAX_NUM_BATCHED_TOKENS_CONFIG_FOR_PREFILL = [1024, 2048, 4096, 8192, 16384, 32768]
 DECODE_PREFIX_LEN_CONFIG = [1024, 4096, 8192, 16384, 32768]
-MAX_NUM_BATCHED_TOKENS_CONFIG_FOR_DECODE = [32, 64]
+MAX_NUM_BATCHED_TOKENS_CONFIG_FOR_DECODE = [32, 64, 128]
 
 KV_DTYPE = jnp.bfloat16
 # KV_DTYPE = jnp.float8_e4m3fn

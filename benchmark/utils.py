@@ -193,4 +193,4 @@ def multiple_iteration_timeit_from_trace(
                     jax.block_until_ready(out)
 
     trace = _load_trace(trace_dir)
-    return _extract_marker_durations_ms(trace, task=task)
+    return _perf_extract_marker_durations_ms(trace, task=task)
