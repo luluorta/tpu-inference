@@ -20,6 +20,7 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 @functools.partial(
     jax.jit,
     static_argnames=["sm_scale", "sliding_window"],
+    donate_argnames=["q", "k", "v", "kv_cache"],
 )
 def _jitted_attn(
     q,
