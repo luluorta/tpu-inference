@@ -75,8 +75,7 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
         moe_backend = select_moe_backend(use_ep)
 
         if use_ep:
-            expert_axis_name = getattr(ShardingAxisName, 'ATTN_DATA_EXPERT',
-                                       None) or ShardingAxisName.EXPERT
+            expert_axis_name = ShardingAxisName.EXPERT
             num_expert_parallelism = get_expert_parallelism(
                 expert_axis_name, mesh)
         else:
