@@ -41,6 +41,7 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
+from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.moe.utils import (get_expert_parallelism,
                                                 select_moe_backend)
@@ -70,11 +71,33 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
         quant_config = vllm_config.quant_config
 
         # --- Sharding Config ---
-        edf_sharding = (None, None, None)
-        expert_axis_name = edf_sharding[0]
-        num_expert_parallelism = get_expert_parallelism(expert_axis_name, mesh)
-        use_ep = num_expert_parallelism > 1
+        use_ep = vllm_config.parallel_config.enable_expert_parallel
         moe_backend = select_moe_backend(use_ep)
+
+        if use_ep:
+            expert_axis_name = getattr(ShardingAxisName, 'ATTN_DATA_EXPERT',
+                                       None) or ShardingAxisName.EXPERT
+            num_expert_parallelism = get_expert_parallelism(
+                expert_axis_name, mesh)
+        else:
+            expert_axis_name = None
+            num_expert_parallelism = 1
+
+        if moe_backend == MoEBackend.GMM_TP:
+            moe_activation_ffw_td = P(ShardingAxisName.MLP_DATA, None)
+            moe_activation_ffw_ted = P(ShardingAxisName.MLP_DATA, None,
+                                       ShardingAxisName.MOE_TENSOR)
+            moe_edf_sharding = P(None, expert_axis_name,
+                                 ShardingAxisName.MOE_TENSOR)
+            moe_efd_sharding = P(None, ShardingAxisName.MOE_TENSOR,
+                                 expert_axis_name)
+        else:  # GMM_EP / FUSED_MOE
+            moe_activation_ffw_td = P(ShardingAxisName.MLP_DATA,
+                                      ShardingAxisName.MOE_TENSOR)
+            moe_activation_ffw_ted = P(ShardingAxisName.MLP_DATA, None,
+                                       ShardingAxisName.MOE_TENSOR)
+            moe_edf_sharding = P(expert_axis_name, None, None)
+            moe_efd_sharding = P(expert_axis_name, None, None)
 
         # Router
         self.gate = JaxLinear(
@@ -111,10 +134,10 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
             router=self.gate,
             num_experts_per_tok=config.num_experts_per_tok,
             mesh=mesh,
-            activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
-            activation_ffw_ted=P(ShardingAxisName.MLP_DATA, None, None),
-            edf_sharding=P(None, ),
-            efd_sharding=P(None, ),
+            activation_ffw_td=moe_activation_ffw_td,
+            activation_ffw_ted=moe_activation_ffw_ted,
+            edf_sharding=moe_edf_sharding,
+            efd_sharding=moe_efd_sharding,
             apply_expert_weight_before_computation=False,
             expert_axis_name=expert_axis_name,
             num_expert_parallelism=num_expert_parallelism,
