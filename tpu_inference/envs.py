@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     MOE_APPROX_TOPK: bool = False
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
+    ENABLE_Q_ACTIVATION_QUANTIZATION: bool = False
     ENABLE_RS_KERNEL: bool = False
     DP_SCHED_BATCH_PREFILL: bool = False
 
@@ -354,6 +355,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("VLLM_TPU_PATCH_MM_EMBEDDINGS", default=False),
     "DISABLE_MLA_Q_ACTIVATION_QUANTIZATION":
     env_bool("DISABLE_MLA_Q_ACTIVATION_QUANTIZATION", default=False),
+    "ENABLE_Q_ACTIVATION_QUANTIZATION":
+    env_bool("ENABLE_Q_ACTIVATION_QUANTIZATION", default=False),
     # Enable hierarchical reduce-scatter kernel for MoE
     "ENABLE_RS_KERNEL":
     env_bool("ENABLE_RS_KERNEL", default=False),

@@ -164,7 +164,7 @@ def ref_ragged_paged_attention(
         k = jnp.repeat(k, actual_num_q_heads_per_kv_head, axis=1)
         v = jnp.repeat(v, actual_num_q_heads_per_kv_head, axis=1)
 
-        if q_scale is not None:
+        if q_scale is not None and q.dtype != k.dtype:
             q = q / q_scale
             if jnp.issubdtype(k.dtype, jnp.floating):
                 dtype_info = jnp.finfo(k.dtype)
@@ -444,7 +444,7 @@ def _ragged_paged_attention_kernel_loop(
         assert k.dtype == v.dtype
 
         # Follow FlashAttention-2 forward pass.
-        if q_scale is not None:
+        if q_scale is not None and q.dtype != k.dtype:
             q = q / q_scale
             if jnp.issubdtype(k.dtype, jnp.floating):
                 dtype_info = jnp.finfo(k.dtype)

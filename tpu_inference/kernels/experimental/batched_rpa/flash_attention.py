@@ -36,7 +36,7 @@ def flash_attention_qk_softmax(
     b, k_heads, tq, _ = q.shape
     s = k.shape[2]
 
-    if cfgs.serve.scale_q is not None:
+    if cfgs.serve.scale_q is not None and q.dtype != k.dtype:
         q = q / cfgs.serve.scale_q
         if jnp.issubdtype(k.dtype, jnp.floating):
             dtype_info = jnp.finfo(k.dtype)
