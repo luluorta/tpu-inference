@@ -43,6 +43,7 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          LoadableWithIterator)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
+import tpu_inference.models.jax.utils.preshard_loader  # noqa: F401  # registers jax_preshard
 
 logger = init_logger(__name__)
 
@@ -333,11 +334,18 @@ def get_flax_model(
         if pooler_config is not None:
             pooler = DispatchPooler.for_embedding(pooler_config)
 
-    jit_model = _get_nnx_model(model_class,
-                               vllm_config,
-                               rng,
-                               mesh,
-                               pooler=pooler)
+    if vllm_config.load_config.load_format == "jax_preshard":
+        from tpu_inference.models.jax.utils.preshard_utils import (
+            get_preshard_path, load_preshard_model)
+        preshard_path = get_preshard_path(vllm_config)
+        jit_model = load_preshard_model(
+            preshard_path, mesh, vllm_config, model_class, rng)
+    else:
+        jit_model = _get_nnx_model(model_class,
+                                   vllm_config,
+                                   rng,
+                                   mesh,
+                                   pooler=pooler)
     vllm_config.model_config.dtype = original_dtype
     kv_cache_sharding = NamedSharding(
         mesh,

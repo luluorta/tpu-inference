@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import jax
 import jax.numpy as jnp
@@ -153,6 +153,25 @@ def cpu_mesh() -> Mesh:
     return _cpu_mesh
 
 
+@contextmanager
 def cpu_mesh_context():
-    """A context to enforce using CPU mesh, used for loading weights on CPU."""
-    return jax.set_mesh(cpu_mesh())
+    """A context to enforce using CPU mesh, used for loading weights on CPU.
+
+    Becomes a no-op when called inside any tracing context where `jax.set_mesh`
+    is forbidden (jit, eval_shape, vmap, grad, checkpoint). This lets weight-
+    processing helpers that wrap their bodies in `with cpu_mesh_context():`
+    also be reused under abstract tracing (e.g. preshard load reconstructing
+    the post-load module structure).
+
+    The detection condition `not trace_state_clean()` is exactly the one that
+    `jax.set_mesh.__init__` enforces, so the two stay in lock-step regardless
+    of which tracer types JAX adds in the future.
+    """
+    # `trace_state_clean` is also what jax.set_mesh checks internally — using
+    # the same primitive means we never disagree with set_mesh's own gating.
+    from jax._src.core import trace_state_clean
+    if not trace_state_clean():
+        yield
+        return
+    with jax.set_mesh(cpu_mesh()):
+        yield
