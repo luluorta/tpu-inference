@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax import nnx
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from vllm.config import VllmConfig
 
 from tpu_inference.logger import init_logger
@@ -275,6 +275,7 @@ def load_preshard_model(
 
     # 3. Validate against saved sharding info
     sharding_path = os.path.join(directory, PRESHARD_SHARDING_FILENAME)
+    saved_sharding = None
     if os.path.exists(sharding_path):
         with open(sharding_path, "r") as f:
             saved_sharding = json.load(f)
@@ -285,8 +286,10 @@ def load_preshard_model(
             "If the checkpoint is incompatible, orbax restore will fail.",
             directory)
 
-    # 4. Build abstract restore target from model's partition specs
-    abstract_target = _build_abstract_target(abstract_state, mesh)
+    # 4. Build abstract restore target. Prefer saved sharding info as the
+    #    source of truth — see `_build_abstract_target` for why.
+    abstract_target = _build_abstract_target(abstract_state, mesh,
+                                             saved_sharding)
 
     # 5. Restore state via orbax (all processes participate)
     state_dir = os.path.join(directory, PRESHARD_STATE_SUBDIR)
@@ -335,21 +338,53 @@ def _extract_sharding_info(state: nnx.State, mesh: Mesh) -> list:
 def _build_abstract_target(
     abstract_state: nnx.State,
     mesh: Mesh,
+    saved_sharding: list | None = None,
 ) -> Any:
-    """Build an abstract restore target from the model's partition annotations.
+    """Build an abstract restore target with the right sharding for orbax.
 
-    Derives sharding from the abstract model's nnx partition specs, so no
-    external sharding file is needed for the restore itself.
+    Sharding source of truth:
+      - If `saved_sharding` (from sharding.json) is provided, use the saved
+        per-leaf spec. This is required for post-fusion params created via
+        `nnx.Param(shard_put(...))` inside `process_weights_after_loading` —
+        they don't carry partition annotations, so `nnx.get_partition_spec`
+        on the abstract model returns `P()` (replicated) for them. Restoring
+        with a replicated target while the on-disk data is sharded would
+        force orbax to gather across devices (cross-host copy or OOM).
+      - Else fall back to `nnx.get_partition_spec` (legacy / debug path).
+        This is wrong for post-fusion params but preserved as a soft fallback
+        when sharding.json is absent.
     """
-    pspecs = nnx.get_partition_spec(abstract_state)
     flat_state, treedef = jax.tree_util.tree_flatten(abstract_state)
-    flat_pspecs = jax.tree_util.tree_leaves(pspecs)
 
     abstract_leaves = []
-    for leaf, pspec in zip(flat_state, flat_pspecs):
-        sharding = NamedSharding(mesh, pspec)
-        abstract_leaves.append(
-            jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding))
+    if saved_sharding is not None:
+        if len(flat_state) != len(saved_sharding):
+            raise ValueError(
+                f"Internal error: leaf count mismatch when building restore "
+                f"target ({len(flat_state)} vs {len(saved_sharding)}); "
+                f"`_validate_sharding_compatibility` should have caught this.")
+        for leaf, saved in zip(flat_state, saved_sharding):
+            spec_list = saved.get("sharding_spec")
+            if spec_list:
+                # JSON loaded `[..., null, ...]` as Python `[..., None, ...]`;
+                # nested list (tuple-axis sharding) becomes `[['model', ...]]`.
+                pspec = P(*[
+                    tuple(s) if isinstance(s, list) else s for s in spec_list
+                ])
+            else:
+                pspec = P()
+            sharding = NamedSharding(mesh, pspec)
+            abstract_leaves.append(
+                jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                     sharding=sharding))
+    else:
+        flat_pspecs = jax.tree_util.tree_leaves(
+            nnx.get_partition_spec(abstract_state))
+        for leaf, pspec in zip(flat_state, flat_pspecs):
+            sharding = NamedSharding(mesh, pspec)
+            abstract_leaves.append(
+                jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                     sharding=sharding))
 
     return treedef.unflatten(abstract_leaves)
 
@@ -361,13 +396,15 @@ def _validate_sharding_compatibility(
 ) -> None:
     """Validate that the current model's structure matches the saved checkpoint.
 
-    Checks leaf count, shapes, dtypes, and sharding specs. Raises ValueError
-    on any mismatch — a mismatch means the checkpoint is incompatible with
-    the current model code or configuration.
+    Checks leaf count, paths, shapes, and dtypes. Per-leaf sharding specs are
+    intentionally NOT compared: post-fusion params created via
+    `nnx.Param(shard_put(...))` inside `process_weights_after_loading` carry
+    sharding info on the concrete array but lose it under `nnx.eval_shape`,
+    so save (concrete `leaf.sharding.spec`) and load (abstract leaves) cannot
+    reliably agree on those params. Mesh / TP / PP / process_count are still
+    validated at the metadata level in `_load_and_validate_metadata`.
     """
     flat_with_path, _ = jax.tree_util.tree_flatten_with_path(abstract_state)
-    pspecs = jax.tree_util.tree_leaves(
-        nnx.get_partition_spec(abstract_state))
 
     if len(flat_with_path) != len(saved_sharding):
         raise ValueError(
@@ -375,8 +412,8 @@ def _validate_sharding_compatibility(
             f"{len(flat_with_path)} parameters, checkpoint has "
             f"{len(saved_sharding)}")
 
-    for i, ((path, leaf), saved, pspec) in enumerate(
-            zip(flat_with_path, saved_sharding, pspecs)):
+    for i, ((path, leaf), saved) in enumerate(
+            zip(flat_with_path, saved_sharding)):
         current_path = jax.tree_util.keystr(path)
         saved_path = saved.get("path", f"<index {i}>")
 
@@ -396,39 +433,6 @@ def _validate_sharding_compatibility(
             raise ValueError(
                 f"Preshard dtype mismatch at '{current_path}': "
                 f"model expects {leaf.dtype}, checkpoint has {saved_dtype}")
-
-        # Compare sharding specs. `P('model')` and `P('model', None)`
-        # describe the same sharding for a 2D array (trailing axes default to
-        # replicated), but iterate to lists of different lengths. PartitionSpec
-        # normalization at save vs load can drop or keep that trailing None
-        # asymmetrically, so canonicalize by stripping trailing Nones on both
-        # sides before comparing.
-        saved_spec = _normalize_sharding_spec(saved.get("sharding_spec"))
-        current_spec = _normalize_sharding_spec([
-            list(s) if isinstance(s, (list, tuple)) else s for s in pspec
-        ] if pspec else None)
-
-        if saved_spec != current_spec:
-            raise ValueError(
-                f"Preshard sharding mismatch at '{current_path}': "
-                f"model expects {current_spec}, checkpoint has {saved_spec}. "
-                f"This may indicate a TP/EP configuration change.")
-
-
-def _normalize_sharding_spec(spec):
-    """Canonicalize a sharding spec list for equality comparison.
-
-    Returns None for empty / all-replicated specs. Strips trailing None
-    entries so that `['model']` and `['model', None]` compare equal —
-    PartitionSpec treats unspecified trailing axes as replicated, so the
-    two are functionally identical.
-    """
-    if not spec:
-        return None
-    spec = list(spec)
-    while spec and spec[-1] is None:
-        spec.pop()
-    return spec or None
 
 
 def _build_metadata(

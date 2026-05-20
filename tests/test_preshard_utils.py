@@ -160,6 +160,26 @@ class TestBuildAbstractTarget(unittest.TestCase):
             self.assertEqual(orig.shape, abstract.shape)
             self.assertEqual(orig.dtype, abstract.dtype)
 
+    def test_uses_saved_sharding_when_provided(self):
+        # When saved_sharding is provided (the normal preshard load path), the
+        # target sharding must come from sharding.json — not nnx's static
+        # partition_spec, which returns P() for post-fusion params created via
+        # `nnx.Param(shard_put(...))` and would force a replicated restore.
+        from jax.sharding import PartitionSpec as P
+        model = DummyModel(hidden=4)
+        mesh = _make_cpu_mesh()
+        _, state = nnx.split(model)
+        # Hand-craft saved_sharding entries that pin a non-replicated spec on
+        # leaves whose model annotation is replicated.
+        saved_sharding = _extract_sharding_info(state, mesh)
+        for leaf in saved_sharding:
+            leaf["sharding_spec"] = ["tp"]  # axis name matches our 1-cpu mesh
+
+        abstract_target = _build_abstract_target(state, mesh, saved_sharding)
+        for abstract_leaf in jax.tree_util.tree_leaves(abstract_target):
+            # Each rebuilt target must reflect the saved P('tp') spec.
+            self.assertEqual(abstract_leaf.sharding.spec, P("tp"))
+
 
 class TestBuildMetadata(unittest.TestCase):
 
@@ -516,35 +536,6 @@ class TestValidateShardingCompatibility(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _validate_sharding_compatibility(state, sharding_info, mesh)
         self.assertIn("dtype mismatch", str(ctx.exception))
-
-    def test_trailing_none_treated_as_equivalent(self):
-        # `P('model')` and `P('model', None)` describe the same sharding for a
-        # 2D array (trailing axes default to replicated). PartitionSpec
-        # normalization at save vs load can produce one or the other
-        # asymmetrically; the validator must treat them as equal.
-        mesh = _make_cpu_mesh()
-        model = DummyModel(hidden=4)
-        _, state = nnx.split(model)
-        sharding_info = _extract_sharding_info(state, mesh)
-        # Pretend the saved spec has an extra trailing None on a 2D leaf.
-        for leaf in sharding_info:
-            if len(leaf["shape"]) == 2 and leaf["sharding_spec"] is not None:
-                leaf["sharding_spec"] = leaf["sharding_spec"] + [None]
-        # Should not raise.
-        _validate_sharding_compatibility(state, sharding_info, mesh)
-
-    def test_leading_or_middle_none_not_stripped(self):
-        # Only TRAILING Nones are equivalent to absent. A leading None on the
-        # wrong axis is a real sharding mismatch and must still be flagged.
-        mesh = _make_cpu_mesh()
-        model = DummyModel(hidden=4)
-        _, state = nnx.split(model)
-        sharding_info = _extract_sharding_info(state, mesh)
-        # Inject a leading None in front of a non-trivial axis name.
-        sharding_info[0]["sharding_spec"] = [None, "model"]
-        with self.assertRaises(ValueError) as ctx:
-            _validate_sharding_compatibility(state, sharding_info, mesh)
-        self.assertIn("sharding mismatch", str(ctx.exception))
 
 
 class _FakeFusionMethod(QuantizeMethodBase):
