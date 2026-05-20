@@ -397,22 +397,38 @@ def _validate_sharding_compatibility(
                 f"Preshard dtype mismatch at '{current_path}': "
                 f"model expects {leaf.dtype}, checkpoint has {saved_dtype}")
 
-        # Compare sharding specs (normalize: None and [] both mean replicated)
-        saved_spec = saved.get("sharding_spec")
-        current_spec = [
-            list(s) if isinstance(s, (list, tuple)) else s
-            for s in pspec
-        ] if pspec else None
-        if not saved_spec:
-            saved_spec = None
-        if not current_spec:
-            current_spec = None
+        # Compare sharding specs. `P('model')` and `P('model', None)`
+        # describe the same sharding for a 2D array (trailing axes default to
+        # replicated), but iterate to lists of different lengths. PartitionSpec
+        # normalization at save vs load can drop or keep that trailing None
+        # asymmetrically, so canonicalize by stripping trailing Nones on both
+        # sides before comparing.
+        saved_spec = _normalize_sharding_spec(saved.get("sharding_spec"))
+        current_spec = _normalize_sharding_spec([
+            list(s) if isinstance(s, (list, tuple)) else s for s in pspec
+        ] if pspec else None)
 
         if saved_spec != current_spec:
             raise ValueError(
                 f"Preshard sharding mismatch at '{current_path}': "
                 f"model expects {current_spec}, checkpoint has {saved_spec}. "
                 f"This may indicate a TP/EP configuration change.")
+
+
+def _normalize_sharding_spec(spec):
+    """Canonicalize a sharding spec list for equality comparison.
+
+    Returns None for empty / all-replicated specs. Strips trailing None
+    entries so that `['model']` and `['model', None]` compare equal —
+    PartitionSpec treats unspecified trailing axes as replicated, so the
+    two are functionally identical.
+    """
+    if not spec:
+        return None
+    spec = list(spec)
+    while spec and spec[-1] is None:
+        spec.pop()
+    return spec or None
 
 
 def _build_metadata(

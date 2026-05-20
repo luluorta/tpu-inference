@@ -517,6 +517,35 @@ class TestValidateShardingCompatibility(unittest.TestCase):
             _validate_sharding_compatibility(state, sharding_info, mesh)
         self.assertIn("dtype mismatch", str(ctx.exception))
 
+    def test_trailing_none_treated_as_equivalent(self):
+        # `P('model')` and `P('model', None)` describe the same sharding for a
+        # 2D array (trailing axes default to replicated). PartitionSpec
+        # normalization at save vs load can produce one or the other
+        # asymmetrically; the validator must treat them as equal.
+        mesh = _make_cpu_mesh()
+        model = DummyModel(hidden=4)
+        _, state = nnx.split(model)
+        sharding_info = _extract_sharding_info(state, mesh)
+        # Pretend the saved spec has an extra trailing None on a 2D leaf.
+        for leaf in sharding_info:
+            if len(leaf["shape"]) == 2 and leaf["sharding_spec"] is not None:
+                leaf["sharding_spec"] = leaf["sharding_spec"] + [None]
+        # Should not raise.
+        _validate_sharding_compatibility(state, sharding_info, mesh)
+
+    def test_leading_or_middle_none_not_stripped(self):
+        # Only TRAILING Nones are equivalent to absent. A leading None on the
+        # wrong axis is a real sharding mismatch and must still be flagged.
+        mesh = _make_cpu_mesh()
+        model = DummyModel(hidden=4)
+        _, state = nnx.split(model)
+        sharding_info = _extract_sharding_info(state, mesh)
+        # Inject a leading None in front of a non-trivial axis name.
+        sharding_info[0]["sharding_spec"] = [None, "model"]
+        with self.assertRaises(ValueError) as ctx:
+            _validate_sharding_compatibility(state, sharding_info, mesh)
+        self.assertIn("sharding mismatch", str(ctx.exception))
+
 
 class _FakeFusionMethod(QuantizeMethodBase):
     """Mock quant_method that mimics FP8 MoE fusion: kernel_a + kernel_b -> kernel_ab."""
