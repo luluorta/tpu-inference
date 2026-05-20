@@ -9,8 +9,10 @@ Uses orbax-checkpoint for serialization, which natively supports multi-host
 save/restore — each process only reads/writes its own addressable shards.
 """
 
+import concurrent.futures
 import json
 import os
+import threading
 import time
 from typing import Any
 
@@ -98,24 +100,15 @@ def save_preshard_checkpoint(
     logger.info("Preshard checkpoint saved to %s in %.2fs", directory, elapsed)
 
 
-def _create_save_checkpointer() -> ocp.AsyncCheckpointer:
-    """Create a checkpointer optimized for preshard saves.
+def _patch_ts_concurrency() -> None:
+    """Patch orbax's module-level tensorstore context for higher IO concurrency.
 
-    Disables per-leaf sharding file writes (serialize_shardings) and array
-    metadata store, which cause O(n_params) small IO operations that timeout
-    on large MoE models. The pytree metadata file is still written (single
-    JSON write, fast).
+    `get_ts_context` deep-copies `_DEFAULT_OCDBT_TS_CONTEXT` on every handler
+    creation, so patching the dict in place affects every subsequent call in
+    this process — both saves and restores. Idempotent across save/load.
     """
-    import jax
-    from orbax.checkpoint._src.handlers import (
-        base_pytree_checkpoint_handler as base_handler)
-    from orbax.checkpoint._src.serialization import (
-        jax_array_handlers, tensorstore_utils as ts_utils,
-        type_handler_registry)
+    from orbax.checkpoint._src.serialization import tensorstore_utils as ts_utils
 
-    # Increase tensorstore IO concurrency for faster writes on networked storage.
-    # Patch the module-level default before handler creation (handler reads it
-    # internally via get_ts_context).
     file_io_concurrency = int(os.environ.get(
         "PRESHARD_FILE_IO_CONCURRENCY", "512"))
     data_copy_concurrency = int(os.environ.get(
@@ -127,6 +120,23 @@ def _create_save_checkpointer() -> ocp.AsyncCheckpointer:
     logger.info(
         "Tensorstore concurrency: file_io=%d, data_copy=%d",
         file_io_concurrency, data_copy_concurrency)
+
+
+def _create_save_checkpointer() -> ocp.AsyncCheckpointer:
+    """Create a checkpointer optimized for preshard saves.
+
+    Disables per-leaf sharding file writes (serialize_shardings) and array
+    metadata store, which cause O(n_params) small IO operations that timeout
+    on large MoE models. The pytree metadata file is still written (single
+    JSON write, fast).
+    """
+    import jax
+    from orbax.checkpoint._src.handlers import (
+        base_pytree_checkpoint_handler as base_handler)
+    from orbax.checkpoint._src.serialization import (jax_array_handlers,
+                                                     type_handler_registry)
+
+    _patch_ts_concurrency()
 
     array_handler = jax_array_handlers.ArrayHandler(
         enable_write_sharding_file=False,
@@ -142,6 +152,46 @@ def _create_save_checkpointer() -> ocp.AsyncCheckpointer:
         handler,
         async_options=ocp.options.AsyncOptions(timeout_secs=7200),
     )
+
+
+def _create_restore_checkpointer() -> ocp.Checkpointer:
+    """Create a checkpointer optimized for preshard restores.
+
+    Mirrors `_create_save_checkpointer`'s tweaks on the read side:
+      - Patches tensorstore `file_io_concurrency` / `data_copy_concurrency` so
+        a fresh restore-only process gets the same elevated IO concurrency the
+        save side enjoys (default 128 → 512). This is the dominant lever on
+        many-leaf MoE checkpoints.
+      - Uses `ArrayHandler(array_metadata_store=None)` to skip the per-restore
+        scan for array-metadata files we never wrote on save.
+      - Sets `restore_concurrent_bytes=None` (vs StandardCheckpointer's 96 GiB
+        cap) so the in-flight byte limiter becomes `UnlimitedInFlightBytes`
+        and shard reads are gated only by `data_copy_concurrency` and OCDBT.
+    """
+    import jax
+    from orbax.checkpoint._src.handlers import (
+        base_pytree_checkpoint_handler as base_handler)
+    from orbax.checkpoint._src.handlers import (
+        pytree_checkpoint_handler as pytree_handler)
+    from orbax.checkpoint._src.serialization import (jax_array_handlers,
+                                                     type_handler_registry)
+
+    _patch_ts_concurrency()
+
+    array_handler = jax_array_handlers.ArrayHandler(
+        array_metadata_store=None,
+    )
+    registry = type_handler_registry.create_type_handler_registry(
+        (jax.Array, array_handler),
+    )
+    base = base_handler.BasePyTreeCheckpointHandler(
+        type_handler_registry=registry,
+        restore_concurrent_bytes=None,
+    )
+    # Wrap with PyTreeCheckpointHandler so that public `ocp.args.PyTreeRestore`
+    # is the registered restore-args type (BasePyTreeRestoreArgs is internal).
+    handler = pytree_handler.PyTreeCheckpointHandler(handler_impl=base)
+    return ocp.Checkpointer(handler)
 
 
 def _fill_abstract_weights_to_load(model: nnx.Module) -> None:
@@ -229,6 +279,89 @@ def _build_post_load_abstract_model(
         return nnx.eval_shape(build)
 
 
+def _start_page_cache_prefetch(state_dir: str) -> threading.Thread | None:
+    """Stream this process's OCDBT data files into the OS page cache.
+
+    Background daemon thread, returns immediately. Lets the main thread's
+    metadata validation / abstract model build / orbax open overlap with disk
+    IO so subsequent tensorstore reads hit warm page cache.
+
+    Mirrors vllm's safetensors prefetch trick (weight_utils.py:725-787) but
+    walks only this process's `ocdbt.process_<my_index>/` subtree, since each
+    orbax process restores only its own addressable shards.
+
+    Skipped (returns None) when:
+      - state_dir is missing
+      - PRESHARD_DISABLE_PREFETCH is truthy
+    """
+    if os.environ.get("PRESHARD_DISABLE_PREFETCH", "").lower() in (
+            "1", "true", "yes"):
+        logger.info("Preshard prefetch disabled via PRESHARD_DISABLE_PREFETCH")
+        return None
+    if not os.path.isdir(state_dir):
+        return None
+
+    my_subdir = os.path.join(
+        state_dir, f"ocdbt.process_{jax.process_index()}")
+    if not os.path.isdir(my_subdir):
+        # Older / non-OCDBT layouts: walk the whole state_dir on process 0
+        # only to avoid duplicate work across processes that share a host.
+        if jax.process_index() != 0:
+            return None
+        my_subdir = state_dir
+
+    files: list[str] = []
+    for root, _, names in os.walk(my_subdir):
+        for n in names:
+            files.append(os.path.join(root, n))
+    if not files:
+        return None
+
+    # Sort for deterministic prefetch order (helps logs / debugging only).
+    files.sort()
+
+    block_size = 16 * 1024 * 1024
+    max_workers = int(os.environ.get("PRESHARD_PREFETCH_THREADS", "8"))
+
+    def _prefetch_one(path: str) -> int:
+        try:
+            n = 0
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(block_size)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+            return n
+        except Exception:
+            logger.warning("Preshard prefetch failed for %s",
+                           path, exc_info=True)
+            return 0
+
+    def _run() -> None:
+        t0 = time.perf_counter()
+        total = 0
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="preshard-prefetch") as ex:
+            for n in ex.map(_prefetch_one, files):
+                total += n
+        elapsed = time.perf_counter() - t0
+        gb = total / (1024**3)
+        rate = gb / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Preshard prefetch done: %d files, %.2f GiB in %.2fs (%.2f GiB/s)",
+            len(files), gb, elapsed, rate)
+
+    logger.info(
+        "Preshard prefetch started (background): dir=%s, files=%d, threads=%d",
+        my_subdir, len(files), max_workers)
+    t = threading.Thread(
+        target=_run, name="preshard-prefetch-driver", daemon=True)
+    t.start()
+    return t
+
+
 def load_preshard_model(
     directory: str,
     mesh: Mesh,
@@ -261,6 +394,12 @@ def load_preshard_model(
     """
     t0 = time.perf_counter()
 
+    # Kick off background prefetch ASAP so the OS page cache warms while we
+    # do metadata validation + abstract model construction below. No-op when
+    # the data is already cached or the env opt-out is set.
+    state_dir = os.path.join(directory, PRESHARD_STATE_SUBDIR)
+    _start_page_cache_prefetch(state_dir)
+
     # 1. Load and validate metadata
     _load_and_validate_metadata(directory, vllm_config, mesh)
 
@@ -292,9 +431,9 @@ def load_preshard_model(
                                              saved_sharding)
 
     # 5. Restore state via orbax (all processes participate)
-    state_dir = os.path.join(directory, PRESHARD_STATE_SUBDIR)
-    checkpointer = ocp.StandardCheckpointer()
-    restored_state = checkpointer.restore(state_dir, target=abstract_target)
+    checkpointer = _create_restore_checkpointer()
+    restored_state = checkpointer.restore(
+        state_dir, args=ocp.args.PyTreeRestore(item=abstract_target))
     logger.info("Restored state from %s", state_dir)
 
     # 6. Reconstruct the model
