@@ -672,5 +672,23 @@ class TestCpuMeshContextNoopUnderTrace(unittest.TestCase):
             self.assertIn(cpu, list(arr.sharding.device_set))
 
 
+class TestShardPutUnderTrace(unittest.TestCase):
+    """`shard_put` is called from process_weights_after_loading without an
+    explicit mesh; it must fall back to `get_abstract_mesh()` under a trace,
+    not `get_mesh()` (which raises inside jit/eval_shape)."""
+
+    def test_shard_put_no_mesh_under_eval_shape(self):
+        from tpu_inference.models.jax.utils.weight_utils import shard_put
+        mesh = _make_cpu_mesh()
+
+        def fn(x):
+            # Pspec must be a tuple; () means fully replicated.
+            return shard_put(x, ())
+
+        with jax.set_mesh(mesh):
+            out = jax.eval_shape(fn, jnp.zeros((4, 4)))
+        self.assertEqual(out.shape, (4, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -223,14 +223,31 @@ def shard_put(x: jax.Array,
               mesh: jax.sharding.Mesh | None = None) -> jax.Array:
     # Single device sharding requires this special handling
     # to avoid the recursive jit error.
+    from jax._src.core import trace_state_clean
+    in_trace = not trace_state_clean()
+
     if mesh is None:
-        mesh = get_mesh()
+        # `get_mesh()` raises inside any jit/eval_shape trace; under tracing
+        # the equivalent is `get_abstract_mesh()`. Both are populated by
+        # `with jax.set_mesh(...)` at the boundary, so the result is the
+        # caller's intended mesh in either context. Detection uses
+        # `trace_state_clean` — the same primitive that `get_mesh` itself
+        # checks internally — so we never disagree with its gating.
+        mesh = (jax.sharding.get_abstract_mesh()
+                if in_trace else get_mesh())
 
     x_mesh = None
-    if isinstance(x.sharding, NamedSharding):
+    if not in_trace and isinstance(x.sharding, NamedSharding):
+        # `x.sharding` is unavailable on a tracer; `x_mesh` is only consumed
+        # by the ray-multihost branch of `general_device_put`, which doesn't
+        # run under abstract tracing anyway.
         x_mesh = x.sharding.mesh
 
-    if math.prod(mesh.axis_sizes) == 1:
+    if not in_trace and math.prod(mesh.axis_sizes) == 1:
+        # Eager single-device fast-path; avoids a recursive jit error that
+        # `general_device_put` triggers in this case. Under tracing, the
+        # mesh is abstract (no `.devices`) and the recursive-jit concern
+        # doesn't apply, so fall through to the general path below.
         return jax.device_put(x, mesh.devices.flatten()[0])
 
     if shardings is None:
